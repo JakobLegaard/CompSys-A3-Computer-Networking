@@ -1,0 +1,30 @@
+
+*.o
+*.zip
+
+
+*.tsv
+planet-latest_geonames.tsv
+
+
+*~
+.DS_Store
+.vscode/
+
+# Executables
+id_query_naive
+id_query_indexed
+id_query_binsort
+coord_query_naive
+coord_query_kdtree
+random_ids
+
+# Test files
+test_*.txt
+test_*.tsv
+output_*.txt
+planet-latest*
+*.o
+
+# Valgrind output
+valgrind_*.txt
