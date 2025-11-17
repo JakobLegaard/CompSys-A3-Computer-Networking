@@ -75,12 +75,11 @@ def get_random_salt():
     Function to generate a random salt of a length given by the LEN_SALT global
     variable. The salt will be a collection of A-z letters and 0-9.
 
-    Returns the salt as a str
+    Returns the salt as a bytes
     """
-    return ''.join(random.choices(string.ascii_letters+string.digits, k=LEN_SALT))
+    return os.urandom(LEN_SALT)
 
-
-def assemble_signature(password: str, salt: str):
+def assemble_signature(password: bytes, salt: bytes):
     """
     Funtion to create a signature out of the provided arguments.
 
@@ -90,9 +89,9 @@ def assemble_signature(password: str, salt: str):
     The password and salt are combined and then hashed according to sha256. 
     Returns signature as bytes
     """
-    salted = f"{password}{salt}"
+    salted = password + salt
     signature = hashlib.sha256()
-    signature.update(str.encode(salted))
+    signature.update(salted)
 
     return signature.digest()
 
@@ -286,7 +285,7 @@ class RequestHandler(socketserver.StreamRequestHandler):
             ### the very first peer, so just create them now.
             if len(network) == 1 and network[0][1] is None:
                 print("I'm assuming I'm a first peer!")
-                my_salt = bytes(get_random_salt(), 'utf-8')
+                my_salt = get_random_salt()
                 my_saveable_sig = assemble_signature(self.server.signature, my_salt)
                 network[0] = (network[0][0], my_saveable_sig, my_salt, time.time())
             
@@ -295,7 +294,7 @@ class RequestHandler(socketserver.StreamRequestHandler):
             # already on the network so if the new peer talks to them it is 
             # authorised correctly. Note we convert it into 
             # bytes as this is what we'll be sending over the network.          
-            salt = bytes(get_random_salt(), 'utf-8')
+            salt = get_random_salt()
             saveable_sig = assemble_signature(signature, salt)
 
             network.append((new_address, saveable_sig, salt, time.time()))
@@ -1012,13 +1011,13 @@ if __name__ == "__main__":
     else:
         print("Server thread printing suppressed")
 
-    password = input("Create password for this peer: ")
+    password = bytes(input("Create password for this peer: "), "utf-8")
 
     # Generate a salt to be applied to our password. This _should_ be random 
     # but for initial development you might find it easier to debug with a 
     # hard-coded value, in which case uncomment the following line and comment
     # out the line after that
-    #salt = "0123456789ABCDEF"
+    #salt = bytes("0123456789ABCDEF", "utf-8")
     salt = get_random_salt()
     
     signature = assemble_signature(password, salt)
