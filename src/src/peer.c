@@ -17,15 +17,14 @@
 
 #include "./peer.h"
 
-// Global variables to be used by both the server and client side of the peer.
-NetworkAddress_t *my_address;
-NetworkAddress_t **network = NULL;
-uint32_t peer_count = 0;
-
 #define REQUEST_HEADER_SIZE (IP_LEN + sizeof(uint32_t) + SHA256_HASH_SIZE + sizeof(uint32_t) + sizeof(uint32_t))
 #define REPLY_HEADER_SIZE   (sizeof(uint32_t) * 4 + SHA256_HASH_SIZE * 2)
 #define PEER_ENTRY_SIZE     (IP_LEN + sizeof(uint32_t) + SHA256_HASH_SIZE + SALT_LEN)
 #define MAX_MESSAGE_SIZE    8196
+
+NetworkAddress_t *my_address;
+NetworkAddress_t **network = NULL;
+uint32_t peer_count = 0;
 
 static void free_network()
 {
@@ -44,8 +43,8 @@ static void free_network()
     peer_count = 0;
 }
 
-/* Helper to parse a reply header from a raw byte buffer (network order). */
-static void parse_reply_header(const unsigned char *buf, ReplyHeader_t *header) {
+static void parse_reply_header(const unsigned char *buf, ReplyHeader_t *header)
+{
     uint32_t tmp;
     size_t offset = 0;
 
@@ -71,7 +70,6 @@ static void parse_reply_header(const unsigned char *buf, ReplyHeader_t *header) 
     memcpy(header->total_hash, buf + offset, SHA256_HASH_SIZE);
 }
 
-/* Initialise network list with ourselves if not already present. */
 static void add_self_to_network_if_missing(void)
 {
     for (uint32_t i = 0; i < peer_count; i++) {
@@ -106,7 +104,6 @@ static void add_self_to_network_if_missing(void)
     peer_count++;
 }
 
-/* Update global network list from a registration reply body. */
 static void update_network_from_body(const char *body, uint32_t body_len)
 {
     if (body_len == 0) {
@@ -166,7 +163,6 @@ static void update_network_from_body(const char *body, uint32_t body_len)
     }
 }
 
-/* Build and send a single-block reply message. */
 static void send_reply(int connfd, uint32_t status, const char *body, uint32_t body_len)
 {
     if (REPLY_HEADER_SIZE + body_len > MAX_MESSAGE_SIZE) {
@@ -181,11 +177,11 @@ static void send_reply(int connfd, uint32_t status, const char *body, uint32_t b
     hdr.block_count = 1;
 
     if (body_len > 0) {
-        get_data_sha(body, hdr.block_hash, body_len, SHA256_HASH_SIZE);
+        get_data_sha((unsigned char*)body, hdr.block_hash, body_len, SHA256_HASH_SIZE);
         memcpy(hdr.total_hash, hdr.block_hash, SHA256_HASH_SIZE);
     } else {
         const char *empty = "";
-        get_data_sha(empty, hdr.block_hash, 0, SHA256_HASH_SIZE);
+        get_data_sha((unsigned char*)empty, hdr.block_hash, 0, SHA256_HASH_SIZE);
         memcpy(hdr.total_hash, hdr.block_hash, SHA256_HASH_SIZE);
     }
 
@@ -229,7 +225,6 @@ static void send_reply(int connfd, uint32_t status, const char *body, uint32_t b
     free(buf);
 }
 
-/* Send INFORM message about new_peer to all other peers in the network. */
 static void send_inform_to_others(NetworkAddress_t *new_peer)
 {
     if (peer_count == 0) {
@@ -301,7 +296,223 @@ static void send_inform_to_others(NetworkAddress_t *new_peer)
     }
 }
 
-/* Per-connection handler for the server side. */
+static NetworkAddress_t* pick_random_peer(void)
+{
+    if (peer_count == 0) {
+        return NULL;
+    }
+
+    int attempts = 0;
+    while (attempts < (int)peer_count * 2) {
+        uint32_t idx = (uint32_t)(rand() % peer_count);
+        NetworkAddress_t *p = network[idx];
+        if (p &&
+            (strncmp(p->ip, my_address->ip, IP_LEN) != 0 || p->port != my_address->port)) {
+            return p;
+        }
+        attempts++;
+    }
+
+    for (uint32_t i = 0; i < peer_count; i++) {
+        NetworkAddress_t *p = network[i];
+        if (p &&
+            (strncmp(p->ip, my_address->ip, IP_LEN) != 0 || p->port != my_address->port)) {
+            return p;
+        }
+    }
+
+    return NULL;
+}
+
+static void retrieve_file_from_network(const char *filename)
+{
+    if (filename == NULL || filename[0] == '\0') {
+        return;
+    }
+
+    NetworkAddress_t *target = pick_random_peer();
+    if (!target) {
+        printf("No peers available to retrieve from.\n");
+        return;
+    }
+
+    char port_str[PORT_STR_LEN];
+    snprintf(port_str, sizeof(port_str), "%u", target->port);
+
+    int clientfd = compsys_helper_open_clientfd(target->ip, port_str);
+    if (clientfd < 0) {
+        fprintf(stderr, "Failed to open connection to peer %s:%s for retrieve\n",
+                target->ip, port_str);
+        return;
+    }
+
+    size_t fname_len = strlen(filename);
+    if (REQUEST_HEADER_SIZE + fname_len > MAX_MESSAGE_SIZE) {
+        fprintf(stderr, "Requested filename too long\n");
+        close(clientfd);
+        return;
+    }
+
+    unsigned char request[REQUEST_HEADER_SIZE];
+    memset(request, 0, sizeof(request));
+    size_t offset = 0;
+
+    memcpy(request + offset, my_address->ip, IP_LEN);
+    offset += IP_LEN;
+
+    uint32_t port_net = htonl(my_address->port);
+    memcpy(request + offset, &port_net, sizeof(uint32_t));
+    offset += sizeof(uint32_t);
+
+    memcpy(request + offset, my_address->signature, SHA256_HASH_SIZE);
+    offset += SHA256_HASH_SIZE;
+
+    uint32_t command_net = htonl(COMMAND_RETREIVE);
+    memcpy(request + offset, &command_net, sizeof(uint32_t));
+    offset += sizeof(uint32_t);
+
+    uint32_t length_net = htonl((uint32_t)fname_len);
+    memcpy(request + offset, &length_net, sizeof(uint32_t));
+    offset += sizeof(uint32_t);
+
+    if (offset != REQUEST_HEADER_SIZE) {
+        fprintf(stderr, "Internal error assembling retrieve request header\n");
+        close(clientfd);
+        return;
+    }
+
+    if (compsys_helper_writen(clientfd, request, REQUEST_HEADER_SIZE) < 0) {
+        fprintf(stderr, "Failed to send retrieve request header\n");
+        close(clientfd);
+        return;
+    }
+
+    if (fname_len > 0) {
+        if (compsys_helper_writen(clientfd, filename, fname_len) < 0) {
+            fprintf(stderr, "Failed to send retrieve request body\n");
+            close(clientfd);
+            return;
+        }
+    }
+
+    unsigned char reply_buf[REPLY_HEADER_SIZE];
+    ssize_t n = compsys_helper_readn(clientfd, reply_buf, REPLY_HEADER_SIZE);
+    if (n != REPLY_HEADER_SIZE) {
+        fprintf(stderr, "Failed to read first reply header for retrieve (got %zd bytes)\n", n);
+        close(clientfd);
+        return;
+    }
+
+    ReplyHeader_t reply_header;
+    parse_reply_header(reply_buf, &reply_header);
+
+    if (reply_header.status != 1) {
+        printf("Retrieve failed with status %u\n", reply_header.status);
+        close(clientfd);
+        return;
+    }
+
+    uint32_t total_blocks = reply_header.block_count;
+    uint32_t received_blocks = 0;
+    uint32_t total_len = 0;
+
+    char *file_data = NULL;
+
+    while (1) {
+        uint32_t body_len = reply_header.length;
+        char *block = NULL;
+
+        if (body_len > 0) {
+            block = (char*)malloc(body_len);
+            if (!block) {
+                fprintf(stderr, "Failed to allocate memory for block\n");
+                free(file_data);
+                close(clientfd);
+                return;
+            }
+
+            ssize_t r = compsys_helper_readn(clientfd, block, body_len);
+            if (r != (ssize_t)body_len) {
+                fprintf(stderr, "Failed to read block body (expected %u, got %zd)\n",
+                        body_len, r);
+                free(block);
+                free(file_data);
+                close(clientfd);
+                return;
+            }
+
+            unsigned char computed_block_hash[SHA256_HASH_SIZE];
+            get_data_sha((unsigned char*)block, computed_block_hash, body_len,
+                         SHA256_HASH_SIZE);
+            if (memcmp(computed_block_hash, reply_header.block_hash, SHA256_HASH_SIZE) != 0) {
+                fprintf(stderr, "Block hash mismatch on block %u\n", reply_header.this_block);
+                free(block);
+                free(file_data);
+                close(clientfd);
+                return;
+            }
+
+            char *new_buf = (char*)realloc(file_data, total_len + body_len);
+            if (!new_buf) {
+                fprintf(stderr, "Failed to grow file buffer\n");
+                free(block);
+                free(file_data);
+                close(clientfd);
+                return;
+            }
+            file_data = new_buf;
+            memcpy(file_data + total_len, block, body_len);
+            total_len += body_len;
+
+            free(block);
+        }
+
+        received_blocks++;
+
+        if (received_blocks >= total_blocks) {
+            break;
+        }
+
+        n = compsys_helper_readn(clientfd, reply_buf, REPLY_HEADER_SIZE);
+        if (n != REPLY_HEADER_SIZE) {
+            fprintf(stderr, "Failed to read subsequent reply header (got %zd bytes)\n", n);
+            free(file_data);
+            close(clientfd);
+            return;
+        }
+
+        parse_reply_header(reply_buf, &reply_header);
+
+        if (reply_header.status != 1) {
+            fprintf(stderr, "Non-success status %u on subsequent block\n", reply_header.status);
+            free(file_data);
+            close(clientfd);
+            return;
+        }
+
+        if (reply_header.block_count != total_blocks) {
+            fprintf(stderr, "Inconsistent block_count in subsequent block\n");
+            free(file_data);
+            close(clientfd);
+            return;
+        }
+    }
+
+    printf("Retrieve reply. Status: 1, length: %u\n", total_len);
+
+    FILE *fp = fopen(filename, "wb");
+    if (!fp) {
+        fprintf(stderr, "Failed to open local file '%s' for writing\n", filename);
+    } else {
+        size_t written = fwrite(file_data, 1, total_len, fp);
+        fclose(fp);
+        printf("Wrote %zu bytes to file '%s'\n", written, filename);
+    }
+
+    free(file_data);
+    close(clientfd);
+}
+
 static void* handle_connection(void *arg)
 {
     int connfd = *(int*)arg;
@@ -311,7 +522,7 @@ static void* handle_connection(void *arg)
     ssize_t n = compsys_helper_readn(connfd, req_buf, REQUEST_HEADER_SIZE);
     if (n != REQUEST_HEADER_SIZE) {
         fprintf(stderr, "Received malformed or short request (%zd bytes)\n", n);
-        send_reply(connfd, 7, NULL, 0); /* 7 = Malformed */
+        send_reply(connfd, 7, NULL, 0);
         close(connfd);
         return NULL;
     }
@@ -354,7 +565,7 @@ static void* handle_connection(void *arg)
         body = (char*)malloc(req.length);
         if (!body) {
             fprintf(stderr, "Failed to allocate request body\n");
-            send_reply(connfd, 6, NULL, 0); /* 6 = Other */
+            send_reply(connfd, 6, NULL, 0);
             close(connfd);
             return NULL;
         }
@@ -405,7 +616,7 @@ static void* handle_connection(void *arg)
             char sig_input[SHA256_HASH_SIZE + SALT_LEN];
             memcpy(sig_input, req.signature, SHA256_HASH_SIZE);
             memcpy(sig_input + SHA256_HASH_SIZE, salt, SALT_LEN);
-            get_data_sha(sig_input, peer->signature,
+            get_data_sha((unsigned char*)sig_input, peer->signature,
                          SHA256_HASH_SIZE + SALT_LEN, SHA256_HASH_SIZE);
 
             NetworkAddress_t **new_list =
@@ -455,7 +666,7 @@ static void* handle_connection(void *arg)
             ptr += SALT_LEN;
         }
 
-        uint32_t status = exists ? 2 : 1; /* 1 = OK, 2 = Peer already exists */
+        uint32_t status = exists ? 2 : 1;
         send_reply(connfd, status, resp_body, body_len);
         free(resp_body);
     } else if (req.command == COMMAND_INFORM) {
@@ -517,8 +728,148 @@ static void* handle_connection(void *arg)
         } else {
             free(peer);
         }
+    } else if (req.command == COMMAND_RETREIVE) {
+        int known = 0;
+        for (uint32_t i = 0; i < peer_count; i++) {
+            if (strncmp(network[i]->ip, req.ip, IP_LEN) == 0 &&
+                network[i]->port == req.port) {
+                known = 1;
+                break;
+            }
+        }
 
-        /* No reply for INFORM */
+        if (!known) {
+            send_reply(connfd, 3, NULL, 0);
+        } else if (body == NULL || req.length == 0) {
+            send_reply(connfd, 7, NULL, 0);
+        } else {
+            char *filename = (char*)malloc(req.length + 1);
+            if (!filename) {
+                send_reply(connfd, 6, NULL, 0);
+            } else {
+                memcpy(filename, body, req.length);
+                filename[req.length] = '\0';
+
+                FILE *fp = fopen(filename, "rb");
+                if (!fp) {
+                    send_reply(connfd, 5, NULL, 0);
+                } else {
+                    if (fseek(fp, 0, SEEK_END) != 0) {
+                        fclose(fp);
+                        send_reply(connfd, 6, NULL, 0);
+                    } else {
+                        long fsize_long = ftell(fp);
+                        if (fsize_long < 0) {
+                            fclose(fp);
+                            send_reply(connfd, 6, NULL, 0);
+                        } else {
+                            uint32_t fsize = (uint32_t)fsize_long;
+                            rewind(fp);
+
+                            char *filebuf = (char*)malloc(fsize);
+                            if (!filebuf) {
+                                fclose(fp);
+                                send_reply(connfd, 6, NULL, 0);
+                            } else {
+                                size_t read_bytes = fread(filebuf, 1, fsize, fp);
+                                fclose(fp);
+
+                                if (read_bytes != fsize) {
+                                    free(filebuf);
+                                    send_reply(connfd, 6, NULL, 0);
+                                } else {
+                                    uint32_t max_body = MAX_MESSAGE_SIZE - REPLY_HEADER_SIZE;
+                                    uint32_t block_count = (fsize == 0) ? 1 :
+                                        (fsize + max_body - 1) / max_body;
+
+                                    unsigned char total_hash[SHA256_HASH_SIZE];
+                                    if (fsize > 0) {
+                                        get_data_sha((unsigned char*)filebuf, total_hash,
+                                                     fsize, SHA256_HASH_SIZE);
+                                    } else {
+                                        const char *empty = "";
+                                        get_data_sha((unsigned char*)empty, total_hash,
+                                                     0, SHA256_HASH_SIZE);
+                                    }
+
+                                    for (uint32_t b = 0; b < block_count; b++) {
+                                        uint32_t offset_b = b * max_body;
+                                        uint32_t this_len;
+                                        if (b == block_count - 1) {
+                                            if (fsize > offset_b) {
+                                                this_len = fsize - offset_b;
+                                            } else {
+                                                this_len = 0;
+                                            }
+                                        } else {
+                                            this_len = max_body;
+                                        }
+
+                                        ReplyHeader_t rh;
+                                        rh.length = this_len;
+                                        rh.status = 1;
+                                        rh.this_block = b;
+                                        rh.block_count = block_count;
+
+                                        unsigned char block_hash[SHA256_HASH_SIZE];
+                                        if (this_len > 0) {
+                                            get_data_sha((unsigned char*)(filebuf + offset_b),
+                                                         block_hash, this_len,
+                                                         SHA256_HASH_SIZE);
+                                        } else {
+                                            const char *empty = "";
+                                            get_data_sha((unsigned char*)empty, block_hash,
+                                                         0, SHA256_HASH_SIZE);
+                                        }
+
+                                        memcpy(rh.block_hash, block_hash, SHA256_HASH_SIZE);
+                                        memcpy(rh.total_hash, total_hash, SHA256_HASH_SIZE);
+
+                                        unsigned char header_buf[REPLY_HEADER_SIZE];
+                                        size_t h_off = 0;
+                                        uint32_t t;
+
+                                        t = htonl(rh.length);
+                                        memcpy(header_buf + h_off, &t, sizeof(uint32_t));
+                                        h_off += sizeof(uint32_t);
+
+                                        t = htonl(rh.status);
+                                        memcpy(header_buf + h_off, &t, sizeof(uint32_t));
+                                        h_off += sizeof(uint32_t);
+
+                                        t = htonl(rh.this_block);
+                                        memcpy(header_buf + h_off, &t, sizeof(uint32_t));
+                                        h_off += sizeof(uint32_t);
+
+                                        t = htonl(rh.block_count);
+                                        memcpy(header_buf + h_off, &t, sizeof(uint32_t));
+                                        h_off += sizeof(uint32_t);
+
+                                        memcpy(header_buf + h_off, rh.block_hash, SHA256_HASH_SIZE);
+                                        h_off += SHA256_HASH_SIZE;
+
+                                        memcpy(header_buf + h_off, rh.total_hash, SHA256_HASH_SIZE);
+                                        h_off += SHA256_HASH_SIZE;
+
+                                        compsys_helper_writen(connfd, header_buf, h_off);
+
+                                        if (this_len > 0) {
+                                            compsys_helper_writen(connfd,
+                                                                  filebuf + offset_b,
+                                                                  this_len);
+                                        }
+                                    }
+
+                                    free(filebuf);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                free(filename);
+            }
+        }
     } else {
         send_reply(connfd, 7, NULL, 0);
     }
@@ -531,13 +882,6 @@ static void* handle_connection(void *arg)
     return NULL;
 }
 
-/*
- * Function to act as thread for all required client interactions. This thread 
- * will be run concurrently with the server_thread. It will start by requesting
- * the IP and port for another peer to connect to. Once both have been provided
- * the thread will register with that peer and expect a response outlining the
- * complete network.
- */ 
 void* client_thread()
 {
     char peer_ip[IP_LEN];
@@ -636,7 +980,7 @@ void* client_thread()
     printf("Got reply. Status: %u, length: %u\n",
            reply_header.status, reply_header.length);
 
-    if (reply_header.status == 1 && body_len > 0) {
+    if ((reply_header.status == 1 || reply_header.status == 2) && body_len > 0) {
         update_network_from_body(body, body_len);
     }
 
@@ -646,13 +990,22 @@ void* client_thread()
 
     close(clientfd);
 
+    while (1) {
+        char filename[256];
+        printf("Enter filename to retrieve (or 'quit' to exit): ");
+        if (scanf("%255s", filename) != 1) {
+            break;
+        }
+        if (strcmp(filename, "quit") == 0) {
+            break;
+        }
+        retrieve_file_from_network(filename);
+    }
+
     return NULL;
 }
 
-/*
- * Function to act as basis for running the server thread. This thread will be
- * run concurrently with the client thread.
- */
+
 void* server_thread()
 {
     add_self_to_network_if_missing();
@@ -702,7 +1055,7 @@ int main(int argc, char **argv)
     {
         fprintf(stderr, "Usage: %s <IP> <PORT>\n", argv[0]);
         exit(EXIT_FAILURE);
-    } 
+    }
 
     my_address = (NetworkAddress_t*)malloc(sizeof(NetworkAddress_t));
     if (!my_address) {
@@ -718,11 +1071,13 @@ int main(int argc, char **argv)
         fprintf(stderr, ">> Invalid peer IP: %s\n", my_address->ip);
         exit(EXIT_FAILURE);
     }
-    
+
     if (!is_valid_port(my_address->port)) {
         fprintf(stderr, ">> Invalid peer port: %d\n", my_address->port);
         exit(EXIT_FAILURE);
     }
+
+    srand((unsigned int)time(NULL));
 
     char password[PASSWORD_LEN];
     fprintf(stdout, "Create a password to proceed: ");
@@ -738,7 +1093,7 @@ int main(int argc, char **argv)
     char salted[PASSWORD_LEN + SALT_LEN + 1];
     memset(salted, 0, sizeof(salted));
     snprintf(salted, sizeof(salted), "%s%s", password, salt);
-    get_data_sha(salted, my_address->signature,
+    get_data_sha((unsigned char*)salted, my_address->signature,
                  (uint32_t)strlen(salted), SHA256_HASH_SIZE);
 
     pthread_t client_thread_id;
