@@ -12,7 +12,7 @@
 #ifdef __APPLE__
 #include "./endian.h"
 #else
-#include <endian.h>
+#include <endian.h> 
 #endif
 
 #include "./peer.h"
@@ -730,16 +730,28 @@ static void* handle_connection(void *arg)
         }
     } else if (req.command == COMMAND_RETREIVE) {
         int known = 0;
+        int sig_match = 0;
         for (uint32_t i = 0; i < peer_count; i++) {
             if (strncmp(network[i]->ip, req.ip, IP_LEN) == 0 &&
                 network[i]->port == req.port) {
                 known = 1;
+                char test_sig[SHA256_HASH_SIZE];
+                char sig_input[SHA256_HASH_SIZE + SALT_LEN];
+                memcpy(sig_input, req.signature, SHA256_HASH_SIZE);
+                memcpy (sig_input + SHA256_HASH_SIZE, network[i]->salt, SALT_LEN);
+                get_data_sha((unsigned char*)sig_input, test_sig,
+                             SHA256_HASH_SIZE + SALT_LEN, SHA256_HASH_SIZE);
+                if (memcmp (network[i]->signature, test_sig, SHA256_HASH_SIZE) == 0) {
+                    sig_match = 1;
+                }
                 break;
             }
         }
-
         if (!known) {
             send_reply(connfd, 3, NULL, 0);
+        } else if (!sig_match) {
+            printf("Users passwords doesnt match\n");
+                send_reply(connfd, 4, NULL, 0);
         } else if (body == NULL || req.length == 0) {
             send_reply(connfd, 7, NULL, 0);
         } else {
@@ -1087,7 +1099,8 @@ int main(int argc, char **argv)
         password[i] = '\0';
     }
 
-    char salt[SALT_LEN + 1] = "0123456789ABCDEF";
+    char salt[SALT_LEN];
+    generate_random_salt(salt);
     memcpy(my_address->salt, salt, SALT_LEN);
 
     char salted[PASSWORD_LEN + SALT_LEN + 1];
