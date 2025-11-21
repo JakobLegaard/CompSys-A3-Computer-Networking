@@ -26,7 +26,7 @@ NetworkAddress_t *my_address;
 NetworkAddress_t **network = NULL;
 uint32_t peer_count = 0;
 
-static void free_network()
+static void free_network(void)
 {
     if (network == NULL) {
         peer_count = 0;
@@ -177,11 +177,11 @@ static void send_reply(int connfd, uint32_t status, const char *body, uint32_t b
     hdr.block_count = 1;
 
     if (body_len > 0) {
-        get_data_sha((unsigned char*)body, hdr.block_hash, body_len, SHA256_HASH_SIZE);
+        get_data_sha((char*)body, hdr.block_hash, body_len, SHA256_HASH_SIZE);
         memcpy(hdr.total_hash, hdr.block_hash, SHA256_HASH_SIZE);
     } else {
         const char *empty = "";
-        get_data_sha((unsigned char*)empty, hdr.block_hash, 0, SHA256_HASH_SIZE);
+        get_data_sha((char*)empty, hdr.block_hash, 0, SHA256_HASH_SIZE);
         memcpy(hdr.total_hash, hdr.block_hash, SHA256_HASH_SIZE);
     }
 
@@ -388,7 +388,7 @@ static void retrieve_file_from_network(const char *filename)
     }
 
     if (fname_len > 0) {
-        if (compsys_helper_writen(clientfd, filename, fname_len) < 0) {
+        if (compsys_helper_writen(clientfd, (void*)filename, fname_len) < 0) {
             fprintf(stderr, "Failed to send retrieve request body\n");
             close(clientfd);
             return;
@@ -442,7 +442,7 @@ static void retrieve_file_from_network(const char *filename)
             }
 
             unsigned char computed_block_hash[SHA256_HASH_SIZE];
-            get_data_sha((unsigned char*)block, computed_block_hash, body_len,
+            get_data_sha((char*)block, computed_block_hash, body_len,
                          SHA256_HASH_SIZE);
             if (memcmp(computed_block_hash, reply_header.block_hash, SHA256_HASH_SIZE) != 0) {
                 fprintf(stderr, "Block hash mismatch on block %u\n", reply_header.this_block);
@@ -616,7 +616,7 @@ static void* handle_connection(void *arg)
             char sig_input[SHA256_HASH_SIZE + SALT_LEN];
             memcpy(sig_input, req.signature, SHA256_HASH_SIZE);
             memcpy(sig_input + SHA256_HASH_SIZE, salt, SALT_LEN);
-            get_data_sha((unsigned char*)sig_input, peer->signature,
+            get_data_sha((char*)sig_input, peer->signature,
                          SHA256_HASH_SIZE + SALT_LEN, SHA256_HASH_SIZE);
 
             NetworkAddress_t **new_list =
@@ -739,7 +739,7 @@ static void* handle_connection(void *arg)
                 char sig_input[SHA256_HASH_SIZE + SALT_LEN];
                 memcpy(sig_input, req.signature, SHA256_HASH_SIZE);
                 memcpy (sig_input + SHA256_HASH_SIZE, network[i]->salt, SALT_LEN);
-                get_data_sha((unsigned char*)sig_input, test_sig,
+                get_data_sha((char*)sig_input, (uint8_t*)test_sig,
                              SHA256_HASH_SIZE + SALT_LEN, SHA256_HASH_SIZE);
                 if (memcmp (network[i]->signature, test_sig, SHA256_HASH_SIZE) == 0) {
                     sig_match = 1;
@@ -796,11 +796,11 @@ static void* handle_connection(void *arg)
 
                                     unsigned char total_hash[SHA256_HASH_SIZE];
                                     if (fsize > 0) {
-                                        get_data_sha((unsigned char*)filebuf, total_hash,
+                                        get_data_sha((char*)filebuf, total_hash,
                                                      fsize, SHA256_HASH_SIZE);
                                     } else {
                                         const char *empty = "";
-                                        get_data_sha((unsigned char*)empty, total_hash,
+                                        get_data_sha((char*)empty, total_hash,
                                                      0, SHA256_HASH_SIZE);
                                     }
 
@@ -825,12 +825,12 @@ static void* handle_connection(void *arg)
 
                                         unsigned char block_hash[SHA256_HASH_SIZE];
                                         if (this_len > 0) {
-                                            get_data_sha((unsigned char*)(filebuf + offset_b),
+                                            get_data_sha((char*)(filebuf + offset_b),
                                                          block_hash, this_len,
                                                          SHA256_HASH_SIZE);
                                         } else {
                                             const char *empty = "";
-                                            get_data_sha((unsigned char*)empty, block_hash,
+                                            get_data_sha((char*)empty, block_hash,
                                                          0, SHA256_HASH_SIZE);
                                         }
 
@@ -894,11 +894,13 @@ static void* handle_connection(void *arg)
     return NULL;
 }
 
-void* client_thread()
+void* client_thread(void* arg)
 {
+    (void)arg;
+    
     char peer_ip[IP_LEN];
     fprintf(stdout, "Enter peer IP to connect to: ");
-    scanf("%16s", peer_ip);
+    scanf("%15s", peer_ip);
 
     for (int i = strlen(peer_ip); i < IP_LEN; i++) {
         peer_ip[i] = '\0';
@@ -906,7 +908,7 @@ void* client_thread()
 
     char peer_port[PORT_STR_LEN];
     fprintf(stdout, "Enter peer port to connect to: ");
-    scanf("%16s", peer_port);
+    scanf("%7s", peer_port);
 
     for (int i = strlen(peer_port); i < PORT_STR_LEN; i++) {
         peer_port[i] = '\0';
@@ -1018,8 +1020,10 @@ void* client_thread()
 }
 
 
-void* server_thread()
+void* server_thread(void* arg)
 {
+    (void)arg;
+
     add_self_to_network_if_missing();
 
     char port_str[PORT_STR_LEN];
@@ -1093,7 +1097,7 @@ int main(int argc, char **argv)
 
     char password[PASSWORD_LEN];
     fprintf(stdout, "Create a password to proceed: ");
-    scanf("%16s", password);
+    scanf("%15s", password);
 
     for (int i = strlen(password); i < PASSWORD_LEN; i++) {
         password[i] = '\0';
@@ -1106,7 +1110,7 @@ int main(int argc, char **argv)
     char salted[PASSWORD_LEN + SALT_LEN + 1];
     memset(salted, 0, sizeof(salted));
     snprintf(salted, sizeof(salted), "%s%s", password, salt);
-    get_data_sha((unsigned char*)salted, my_address->signature,
+    get_data_sha((char*)salted, my_address->signature,
                  (uint32_t)strlen(salted), SHA256_HASH_SIZE);
 
     pthread_t client_thread_id;
