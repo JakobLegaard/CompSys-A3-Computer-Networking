@@ -75,11 +75,12 @@ def get_random_salt():
     Function to generate a random salt of a length given by the LEN_SALT global
     variable. The salt will be a collection of A-z letters and 0-9.
 
-    Returns the salt as a bytes
+    Returns the salt as a str
     """
-    return os.urandom(LEN_SALT)
+    return ''.join(random.choices(string.ascii_letters+string.digits, k=LEN_SALT))
 
-def assemble_signature(password: bytes, salt: bytes):
+
+def assemble_signature(password: str, salt: str):
     """
     Funtion to create a signature out of the provided arguments.
 
@@ -89,9 +90,9 @@ def assemble_signature(password: bytes, salt: bytes):
     The password and salt are combined and then hashed according to sha256. 
     Returns signature as bytes
     """
-    salted = password + salt
+    salted = f"{password}{salt}"
     signature = hashlib.sha256()
-    signature.update(salted)
+    signature.update(str.encode(salted))
 
     return signature.digest()
 
@@ -262,11 +263,6 @@ class RequestHandler(socketserver.StreamRequestHandler):
 
         new_address = f"{ip}:{port}"
 
-        # Setup some variables to store the registering peers signature and 
-        # salt
-        salt = None
-        saveable_sig = None
-
         # Register a new peer. Note that as we aquire a mutex we need to make 
         # sure to release it in all circumstances
         network_mutex.acquire()
@@ -278,22 +274,11 @@ class RequestHandler(socketserver.StreamRequestHandler):
                     f"Cannot register peer '{new_address}', already exists"
                 )
                 return
-
-            ### Quick hack to keep as consistent with handed out functionality 
-            ### as possible. If we're have a registration request, but havn't
-            ### updated our own network signature and salt, then we're probably
-            ### the very first peer, so just create them now.
-            if len(network) == 1 and network[0][1] is None:
-                print("I'm assuming I'm a first peer!")
-                my_salt = get_random_salt()
-                my_saveable_sig = assemble_signature(self.server.signature, my_salt)
-                network[0] = (network[0][0], my_saveable_sig, my_salt, time.time())
             
             # Don't save the given signature directly. Salt and hash it first.
             # We'll need to give this salt and signature to the other peers 
             # already on the network so if the new peer talks to them it is 
-            # authorised correctly. Note we convert it into 
-            # bytes as this is what we'll be sending over the network.          
+            # authorised correctly.            
             salt = get_random_salt()
             saveable_sig = assemble_signature(signature, salt)
 
@@ -301,15 +286,13 @@ class RequestHandler(socketserver.StreamRequestHandler):
 
             # Construct a reply containing the entire network for the peer
             payload = bytearray()
-            for peer, network_signature, network_salt, _ in network:
-                ### Only notify about complete network entries
-                if network_signature is not None and network_salt is not None:
-                    ip, port = peer.split(':')
-                    payload.extend(
-                        bytes(ip[:LEN_IP].ljust(LEN_IP, '\x00'), 'utf-8'))
-                    payload.extend(struct.pack('!I', int(port)))
-                    payload.extend(network_signature)
-                    payload.extend(network_salt)
+            for peer, saved_signature, salt, _ in network:
+                ip, port = peer.split(':')
+                payload.extend(
+                    bytes(ip[:LEN_IP].ljust(LEN_IP, '\x00'), 'utf-8'))
+                payload.extend(struct.pack('!I', int(port)))
+                payload.extend(saved_signature)
+                payload.extend(bytes(salt, 'utf-8'))
             network_mutex.release()
         except Exception as e:
             network_mutex.release()
@@ -334,8 +317,7 @@ class RequestHandler(socketserver.StreamRequestHandler):
                     msg.extend(
                         bytes(ip[:LEN_IP].ljust(LEN_IP, '\x00'), 'utf-8'))
                     msg.extend(struct.pack('!I', int(port)))
-                    msg.extend(saveable_sig)
-                    msg.extend(salt)
+                    msg.extend(signature)
 
                     # We don't mind if this message breaks, its just a nice to 
                     # have update so we won't bother listening for an 
@@ -422,20 +404,19 @@ class RequestHandler(socketserver.StreamRequestHandler):
         # Check that the requesting peer has already registered.     
         match = False
         address = f"{ip}:{port}"
-        for network_address, network_signature, network_salt , _ in network:
-            if network_address == address:
+        for peer_address, peer_signature, peer_salt , _ in network:
+            if peer_address == address:
                 match = True
 
                 # If we've found a matching peer in our network, check that the
                 # given signature matches our previously stored one
-                testable_signature = assemble_signature(signature, network_salt)
+                testable_signature = assemble_signature(signature, peer_salt)
 
-                if network_signature != testable_signature:
+                if peer_signature != testable_signature:
                     self.handle_error(
                         STATUS_BAD_PASSWORD,
                         f"User passwords do not match")
                     return
-                break
         
         # Refuse to serve a file if the requesting peer has not already 
         # registered
@@ -754,14 +735,8 @@ def to_server(my_ip: str, my_port: int, my_signature: bytes, peer_ip: str,
 
                     address = f'{ip}:{port}'
 
-                    ### check to see if the address we've recieved is ours. If 
-                    ### it is we can use its salt and signature as our 
-                    ### network-assignmed salt and signature
-                    if address == network[0][0]:
-                        network[0] = (address, signature, salt, time.time())
-
                     if address not in [a for a, _, _, _ in network]:
-                        network.append((address, signature, salt, time.time()))                    
+                        network.append((address, signature, salt, time.time()))
 
                 print(f"Got network: {', '.join([a for a, _, _, _ in network])}")
                 network_mutex.release()
@@ -1011,21 +986,18 @@ if __name__ == "__main__":
     else:
         print("Server thread printing suppressed")
 
-    password = bytes(input("Create password for this peer: "), "utf-8")
+    password = input("Create password for this peer: ")
 
     # Generate a salt to be applied to our password. This _should_ be random 
     # but for initial development you might find it easier to debug with a 
     # hard-coded value, in which case uncomment the following line and comment
     # out the line after that
-    #salt = bytes("0123456789ABCDEF", "utf-8")
+    #salt = "0123456789ABCDEF"
     salt = get_random_salt()
     
     signature = assemble_signature(password, salt)
 
-    ### We can add ourselves to the network, but note that we don't know what
-    ### our network saved salt or signature will be yet, we must wait for a 
-    ### reply to our registration is before updating this
-    network.append((f"{args.my_ip}:{int(args.my_port)}", None, None, -1))
+    network.append((f"{args.my_ip}:{int(args.my_port)}", signature, salt, -1))
 
     # Start client interaction. Note that we do not wait for this thread
     # to complete before moving on to starting the server, both should be 
